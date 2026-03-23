@@ -1,15 +1,38 @@
 #!/usr/bin/env python3
 """
 fetch_nse_tri.py — Download TRI (Total Return Index) data for NIFTY indices
-that are not available on Yahoo Finance, using the nsepython library
-(which pulls from niftyindices.com without requiring a login).
+using the nsepython library (which pulls from niftyindices.com without
+requiring a login).
+
+Covers indices not available on Yahoo Finance, plus additional broad/strategy
+indices needed for index fund tracking error analysis.
+
+BSE/Sensex indices are NOT available via nsepython (NSE's own API only).
 
 Indices fetched
 ---------------
-  NIFTY Smallcap 250 TRI        NIFTY SMLCAP 250
-  NIFTY Midcap 150 TRI          NIFTY MIDCAP 150
-  NIFTY Large Midcap 250 TRI    NIFTY LARGEMID250
-  NIFTY 500 Multicap 50:25:25 TRI  NIFTY500 MULTICAP
+  Broad market
+    NIFTY 50 TRI                  NIFTY 50
+    NIFTY 50 Equal Weight TRI     NIFTY50 EQL WGT
+    NIFTY Next 50 TRI             NIFTY NEXT 50
+    NIFTY 100 TRI *               NIFTY 100
+    NIFTY 200 TRI                 NIFTY 200
+    NIFTY 500 TRI *               NIFTY 500
+    NIFTY Total Market TRI        NIFTY TOTAL MKT
+
+  Mid / small cap
+    NIFTY Midcap 50 TRI           NIFTY MIDCAP 50
+    NIFTY Midcap 100 TRI *        NIFTY MIDCAP 100
+    NIFTY Midcap 150 TRI *        NIFTY MIDCAP 150
+    NIFTY MidSmallcap 400 TRI     NIFTY MIDSML 400
+    NIFTY Large Midcap 250 TRI *  NIFTY LARGEMID250
+    NIFTY Smallcap 50 TRI         NIFTY SMLCAP 50
+    NIFTY Smallcap 100 TRI        NIFTY SMLCAP 100
+    NIFTY Smallcap 250 TRI *      NIFTY SMLCAP 250
+    NIFTY Microcap 250 TRI        NIFTY MICROCAP250
+    NIFTY 500 Multicap 50:25:25 TRI *  NIFTY500 MULTICAP
+
+  (* previously loaded — INSERT OR IGNORE will skip existing rows)
 
 Data is loaded into benchmark_returns (source = 'nsepython').
 Run build_benchmark_daily_returns.py --append afterwards to
@@ -21,7 +44,7 @@ Usage
     python fetch_nse_tri.py --from 2006-01-01    # custom start date
     python fetch_nse_tri.py --replace            # overwrite existing rows
     python fetch_nse_tri.py --dry-run            # download but don't write to DB
-    python fetch_nse_tri.py --index "NIFTY Smallcap 250 TRI"  # single index
+    python fetch_nse_tri.py --index "NIFTY 50 TRI"  # single index
 """
 
 import argparse
@@ -35,9 +58,24 @@ from db import DB_PATH, get_connection
 # ── Index map: DB benchmark name → NSE symbol ────────────────────────────────
 
 NSE_INDEX_MAP: dict[str, str] = {
-    "NIFTY Smallcap 250 TRI":          "NIFTY SMLCAP 250",
+    # Broad market
+    "NIFTY 50 TRI":                    "NIFTY 50",
+    "NIFTY 50 Equal Weight TRI":       "NIFTY50 EQL WGT",
+    "NIFTY Next 50 TRI":               "NIFTY NEXT 50",
+    "NIFTY 100 TRI":                   "NIFTY 100",
+    "NIFTY 200 TRI":                   "NIFTY 200",
+    "NIFTY 500 TRI":                   "NIFTY 500",
+    "NIFTY Total Market TRI":          "NIFTY TOTAL MKT",
+    # Mid / small cap
+    "NIFTY Midcap 50 TRI":             "NIFTY MIDCAP 50",
+    "NIFTY Midcap 100 TRI":            "NIFTY MIDCAP 100",
     "NIFTY Midcap 150 TRI":            "NIFTY MIDCAP 150",
+    "NIFTY MidSmallcap 400 TRI":       "NIFTY MIDSML 400",
     "NIFTY Large Midcap 250 TRI":      "NIFTY LARGEMID250",
+    "NIFTY Smallcap 50 TRI":           "NIFTY SMLCAP 50",
+    "NIFTY Smallcap 100 TRI":          "NIFTY SMLCAP 100",
+    "NIFTY Smallcap 250 TRI":          "NIFTY SMLCAP 250",
+    "NIFTY Microcap 250 TRI":          "NIFTY MICROCAP250",
     "NIFTY 500 Multicap 50:25:25 TRI": "NIFTY500 MULTICAP",
 }
 
