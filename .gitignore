@@ -1,0 +1,8 @@
+*.db
+raw/
+benchmark_csvs/
+__pycache__/
+*.pyc
+.claude/
+claudesessions.txt
+*.png
