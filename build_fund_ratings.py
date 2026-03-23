@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 """
-build_fund_ratings.py — Rate funds within their category using IR and t-stat alpha.
+build_fund_ratings.py — Rate funds within their peer group.
 
-Method
-------
-1. Within each category, compute percentile rank for IR and t_stat_alpha
-   (higher = better for both).
-2. Average percentile = 0.5 * ir_percentile + 0.5 * tstat_percentile
-3. Rating = avg_percentile / 20, rounded to 1 decimal, capped at [0.0, 5.0]
+Active funds  (from fund_performance)
+--------------------------------------
+Metric: 50% IR percentile + 50% t_stat_alpha percentile  (higher = better).
+Peer group: SEBI category (e.g. 'Equity Scheme - Large Cap Fund').
 
-Percentile is computed using fractional rank within category (ties averaged),
-giving values in (0, 100].  A fund at the very top of its category scores
-100 → rating 5.0.
+Index funds  (from index_fund_performance)
+-------------------------------------------
+Metric: tracking_error percentile  (lower TE = higher percentile = better).
+Peer group: tracked index (e.g. 'NIFTY 50 TRI').
+ir_pct / tstat_pct columns are both set to the TE percentile for uniformity.
+
+Both types share the same fund_ratings table and 0–5 star rating scale:
+  rating = avg_pct / 20, rounded to 1 dp, capped at [0.0, 5.0]
+  A fund at the very top of its peer group scores 100 → 5.0 stars.
 
 Output
 ------
-Populates the fund_ratings table:
+Populates fund_ratings:
   scheme_code, category, n_peers, ir_pct, tstat_pct, avg_pct, rating
 
 Usage
 -----
     python build_fund_ratings.py
-    python build_fund_ratings.py --min-peers 5
+    python build_fund_ratings.py --min-peers 3
 """
 
 import argparse
@@ -33,18 +37,20 @@ from db import DB_PATH, get_connection
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS fund_ratings (
     scheme_code  INTEGER PRIMARY KEY REFERENCES schemes(scheme_code),
-    category     TEXT    NOT NULL,
-    n_peers      INTEGER NOT NULL,   -- funds in same category used for ranking
-    ir_pct       REAL    NOT NULL,   -- percentile rank on IR within category (0-100]
-    tstat_pct    REAL    NOT NULL,   -- percentile rank on t_stat_alpha within category (0-100]
-    avg_pct      REAL    NOT NULL,   -- weighted average percentile (50/50)
+    category     TEXT    NOT NULL,   -- SEBI category (active) or tracked index (index funds)
+    n_peers      INTEGER NOT NULL,   -- funds in same peer group used for ranking
+    ir_pct       REAL    NOT NULL,   -- active: IR percentile; index: TE percentile (inverted)
+    tstat_pct    REAL    NOT NULL,   -- active: t-stat percentile; index: TE percentile (inverted)
+    avg_pct      REAL    NOT NULL,   -- average percentile
     rating       REAL    NOT NULL,   -- avg_pct / 20, rounded to 1dp, in [0.0, 5.0]
     computed_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
 """
 
 
-def build(conn, min_peers: int) -> pd.DataFrame:
+# ── Active funds ──────────────────────────────────────────────────────────────
+
+def build_active(conn, min_peers: int) -> pd.DataFrame:
     df = pd.read_sql_query(
         """
         SELECT fp.scheme_code, s.category,
@@ -56,45 +62,79 @@ def build(conn, min_peers: int) -> pd.DataFrame:
         """,
         conn,
     )
-    print(f"Loaded {len(df):,} funds across {df['category'].nunique()} categories")
+    print(f"Active — loaded {len(df):,} funds across {df['category'].nunique()} categories")
 
-    # Filter out categories with too few peers to rank meaningfully
     counts = df.groupby("category")["scheme_code"].transform("count")
     excluded = df[counts < min_peers]["category"].unique()
     if len(excluded):
-        print(f"Skipping {len(excluded)} category(ies) with fewer than {min_peers} peers:")
-        for c in excluded:
-            print(f"  {c}")
+        print(f"  Skipping {len(excluded)} category(ies) with < {min_peers} peers")
     df = df[counts >= min_peers].copy()
-    print(f"Rating {len(df):,} funds across {df['category'].nunique()} categories\n")
+    print(f"  Rating {len(df):,} funds across {df['category'].nunique()} categories")
 
-    # Percentile ranks within category (pct=True → fraction in (0,1], *100 → percentile)
-    df["ir_pct"] = (
-        df.groupby("category")["ir"]
-        .rank(method="average", pct=True) * 100
+    df["ir_pct"]    = df.groupby("category")["ir"].rank(method="average", pct=True) * 100
+    df["tstat_pct"] = df.groupby("category")["t_stat_alpha"].rank(method="average", pct=True) * 100
+    df["avg_pct"]   = 0.5 * df["ir_pct"] + 0.5 * df["tstat_pct"]
+    df["rating"]    = (df["avg_pct"] / 20).round(1).clip(0.0, 5.0)
+    df["n_peers"]   = df.groupby("category")["scheme_code"].transform("count")
+
+    return df[["scheme_code", "category", "n_peers", "ir_pct", "tstat_pct", "avg_pct", "rating"]]
+
+
+# ── Index funds ───────────────────────────────────────────────────────────────
+
+def build_index(conn, min_peers: int) -> pd.DataFrame:
+    # Check table exists
+    exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='index_fund_performance'"
+    ).fetchone()
+    if not exists:
+        print("Index — index_fund_performance table not found, skipping.")
+        return pd.DataFrame()
+
+    df = pd.read_sql_query(
+        """
+        SELECT scheme_code, tracked_index AS category, tracking_error
+        FROM index_fund_performance
+        WHERE tracking_error IS NOT NULL
+        """,
+        conn,
     )
-    df["tstat_pct"] = (
-        df.groupby("category")["t_stat_alpha"]
-        .rank(method="average", pct=True) * 100
-    )
+    if df.empty:
+        print("Index — no data in index_fund_performance.")
+        return df
 
-    df["avg_pct"] = 0.5 * df["ir_pct"] + 0.5 * df["tstat_pct"]
-    df["rating"]  = (df["avg_pct"] / 20).round(1).clip(0.0, 5.0)
-    df["n_peers"] = df.groupby("category")["scheme_code"].transform("count")
+    print(f"Index  — loaded {len(df):,} funds across {df['category'].nunique()} tracked indices")
 
-    return df[["scheme_code", "category", "n_peers",
-               "ir_pct", "tstat_pct", "avg_pct", "rating"]]
+    counts = df.groupby("category")["scheme_code"].transform("count")
+    excluded = df[counts < min_peers]["category"].unique()
+    if len(excluded):
+        print(f"  Skipping {len(excluded)} group(s) with < {min_peers} peers")
+    df = df[counts >= min_peers].copy()
+    print(f"  Rating {len(df):,} funds across {df['category'].nunique()} index groups")
 
+    # Lower tracking error = better = higher percentile: use ascending=False
+    df["te_pct"]    = df.groupby("category")["tracking_error"].rank(
+                          method="average", ascending=False, pct=True) * 100
+    df["ir_pct"]    = df["te_pct"]   # repurposed for uniformity
+    df["tstat_pct"] = df["te_pct"]   # repurposed for uniformity
+    df["avg_pct"]   = df["te_pct"]
+    df["rating"]    = (df["avg_pct"] / 20).round(1).clip(0.0, 5.0)
+    df["n_peers"]   = df.groupby("category")["scheme_code"].transform("count")
+
+    return df[["scheme_code", "category", "n_peers", "ir_pct", "tstat_pct", "avg_pct", "rating"]]
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build fund_ratings table from fund_performance",
+        description="Build fund_ratings table (active + index funds)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--db", default=str(DB_PATH))
     parser.add_argument(
         "--min-peers", type=int, default=3,
-        help="Minimum funds in a category to compute ratings",
+        help="Minimum funds in a peer group to compute ratings",
     )
     args = parser.parse_args()
 
@@ -102,7 +142,11 @@ def main() -> None:
     conn.execute(_CREATE_TABLE)
     conn.commit()
 
-    results = build(conn, args.min_peers)
+    active = build_active(conn, args.min_peers)
+    print()
+    index  = build_index(conn, args.min_peers)
+
+    results = pd.concat([active, index], ignore_index=True)
 
     with conn:
         conn.execute("DELETE FROM fund_ratings")
@@ -116,11 +160,13 @@ def main() -> None:
             results.to_dict("records"),
         )
 
-    print(f"Wrote {len(results):,} rows to fund_ratings\n")
+    total = len(results)
+    print(f"\nWrote {total:,} rows to fund_ratings "
+          f"({len(active):,} active + {len(index):,} index)\n")
 
-    # Summary per category
-    print(f"{'Category':<55} {'Peers':>5}  {'Rating range'}")
-    print("-" * 80)
+    print(f"{'Category / Tracked index':<55} {'Peers':>5}  {'Rating range'}")
+    print("─" * 80)
+    # Active categories first, then index groups
     for cat, grp in results.groupby("category"):
         lo, hi = grp["rating"].min(), grp["rating"].max()
         print(f"{cat:<55} {len(grp):>5}  {lo:.1f} – {hi:.1f}")
